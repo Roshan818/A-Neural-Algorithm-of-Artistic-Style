@@ -1,81 +1,153 @@
-import streamlit as st
-from style_transfer import StyleTransfer
 import torch
-from PIL import Image
-import io
+import torch.nn as nn
+import torch.optim as optim
 import torchvision.transforms as transforms
+import torchvision.models as models
+from PIL import Image
+import copy
+from torch.utils.data import Dataset, DataLoader
+import os
+from tqdm import tqdm
 
-st.set_page_config(page_title="Neural Style Transfer", page_icon="🎨")
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super(ContentLoss, self).__init__()
+        self.target = target.detach()
+        self.loss = nn.MSELoss()
 
-st.title("Neural Style Transfer")
-st.write("Upload a content image and a style image to create artistic compositions!")
+    def forward(self, input):
+        self.loss_value = self.loss(input, self.target)
+        return input
 
-# File uploaders
-content_file = st.file_uploader("Choose a Content Image", type=["png", "jpg", "jpeg"])
-style_file = st.file_uploader("Choose a Style Image", type=["png", "jpg", "jpeg"])
+class StyleLoss(nn.Module):
+    def __init__(self, target_feature):
+        super(StyleLoss, self).__init__()
+        self.target = self._gram_matrix(target_feature).detach()
+        self.loss = nn.MSELoss()
 
-# Sidebar controls
-st.sidebar.title("Style Transfer Parameters")
-num_steps = st.sidebar.slider("Number of Steps", 100, 500, 300)
-style_weight = st.sidebar.slider("Style Weight", 1e4, 1e7, 1e6)
-content_weight = st.sidebar.slider("Content Weight", 1, 1000, 1)
+    def forward(self, input):
+        gram = self._gram_matrix(input)
+        self.loss_value = self.loss(gram, self.target)
+        return input
+    
+    def _gram_matrix(self, input):
+        batch_size, n_channels, h, w = input.size()
+        features = input.view(batch_size * n_channels, h * w)
+        gram = torch.mm(features, features.t())
+        return gram.div(batch_size * n_channels * h * w)
 
-def process_image(image_file):
-    if image_file is not None:
-        # Save the uploaded file temporarily
-        img_path = f"temp_{image_file.name}"
-        with open(img_path, "wb") as f:
-            f.write(image_file.getbuffer())
-        return img_path
-    return None
+class StyleTransfer:
+    def __init__(self, content_img_path, style_img_path, device='cpu', intermediate_callback=None):
+        self.device = device
+        self.content_img = self._image_loader(content_img_path)
+        self.style_img = self._image_loader(style_img_path)
+        self.content_layers = ['conv_4']
+        self.style_layers = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']
+        self.model = models.vgg19(pretrained=True).features.to(device).eval()
+        self.intermediate_callback = intermediate_callback
+        
+    def _image_loader(self, image_path):
+        loader = transforms.Compose([
+            transforms.Resize(512),
+            transforms.ToTensor()])
+        image = Image.open(image_path)
+        image = loader(image).unsqueeze(0)
+        return image.to(self.device, torch.float)
+    
+    def tensor_to_pil(self, tensor):
+        image = tensor.cpu().clone()
+        image = image.squeeze(0)
+        image = transforms.ToPILImage()(image)
+        return image
 
-if content_file and style_file:
-    if st.button("Generate Style Transfer"):
-        with st.spinner("Applying style transfer... This may take a few minutes."):
-            try:
-                # Process uploaded files
-                content_path = process_image(content_file)
-                style_path = process_image(style_file)
+    def run_style_transfer(self, num_steps=300, content_weight=1, style_weight=1000000):
+        input_img = self.content_img.clone()
+        optimizer = optim.LBFGS([input_img.requires_grad_()])
+        
+        style_model, style_losses, content_losses = self._get_style_model_and_losses()
+        
+        run = [0]
+        best_loss = float('inf')
+        best_image = None
+        progress_images = []
+        
+        while run[0] <= num_steps:
+            def closure():
+                input_img.data.clamp_(0, 1)
+                optimizer.zero_grad()
+                style_model(input_img)
                 
-                # Device configuration
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                style_score = 0
+                content_score = 0
                 
-                # Initialize and run style transfer
-                style_transfer = StyleTransfer(content_path, style_path, device)
-                output = style_transfer.run_style_transfer(
-                    num_steps=num_steps,
-                    style_weight=style_weight,
-                    content_weight=content_weight
-                )
+                for sl in style_losses:
+                    style_score += sl.loss_value
+                for cl in content_losses:
+                    content_score += cl.loss_value
+                    
+                style_score *= style_weight
+                content_score *= content_weight
                 
-                # Convert output tensor to image
-                output = output.cpu().squeeze(0)
-                output = transforms.ToPILImage()(output)
+                loss = style_score + content_score
                 
-                # Display results
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.subheader("Content Image")
-                    st.image(content_file)
-                with col2:
-                    st.subheader("Style Image")
-                    st.image(style_file)
-                with col3:
-                    st.subheader("Result")
-                    st.image(output)
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_image = input_img.clone()
                 
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+                loss.backward()
+                
+                if run[0] % 50 == 0 and self.intermediate_callback:
+                    current_img = self.tensor_to_pil(input_img.clone())
+                    progress_images.append({
+                        'step': run[0],
+                        'image': current_img,
+                        'loss': loss.item(),
+                        'style_loss': style_score.item(),
+                        'content_loss': content_score.item()
+                    })
+                    self.intermediate_callback(progress_images[-1])
+                
+                run[0] += 1
+                return loss
+            
+            optimizer.step(closure)
+        
+        input_img.data.clamp_(0, 1)
+        return input_img, progress_images, best_image
 
-st.markdown("""
-### How to use:
-1. Upload a content image (the base image you want to style)
-2. Upload a style image (the image whose artistic style you want to apply)
-3. Adjust the parameters in the sidebar if desired
-4. Click 'Generate Style Transfer' and wait for the magic to happen!
-
-### Parameters:
-- **Number of Steps**: More steps generally means better results but longer processing time
-- **Style Weight**: Higher values make the result more stylized
-- **Content Weight**: Higher values make the result more similar to the content image
-""")
+    def _get_style_model_and_losses(self):
+        cnn = copy.deepcopy(self.model)
+        content_losses = []
+        style_losses = []
+        
+        model = nn.Sequential()
+        i = 0
+        for layer in cnn.children():
+            if isinstance(layer, nn.Conv2d):
+                i += 1
+                name = f'conv_{i}'
+            elif isinstance(layer, nn.ReLU):
+                name = f'relu_{i}'
+                layer = nn.ReLU(inplace=False)
+            elif isinstance(layer, nn.MaxPool2d):
+                name = f'pool_{i}'
+            elif isinstance(layer, nn.BatchNorm2d):
+                name = f'bn_{i}'
+            else:
+                raise RuntimeError(f'Unrecognized layer: {layer.__class__.__name__}')
+                
+            model.add_module(name, layer)
+            
+            if name in self.content_layers:
+                target = model(self.content_img).detach()
+                content_loss = ContentLoss(target)
+                model.add_module(f"content_loss_{i}", content_loss)
+                content_losses.append(content_loss)
+                
+            if name in self.style_layers:
+                target_feature = model(self.style_img).detach()
+                style_loss = StyleLoss(target_feature)
+                model.add_module(f"style_loss_{i}", style_loss)
+                style_losses.append(style_loss)
+                
+        return model, style_losses, content_losses
