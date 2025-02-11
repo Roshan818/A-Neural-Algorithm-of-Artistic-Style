@@ -68,6 +68,7 @@ class StyleTransfer:
         style_model, style_losses, content_losses = self._get_style_model_and_losses()
         
         run = [0]
+        global best_loss
         best_loss = float('inf')
         best_image = None
         progress_images = []
