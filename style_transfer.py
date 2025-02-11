@@ -5,9 +5,6 @@ import torchvision.transforms as transforms
 import torchvision.models as models
 from PIL import Image
 import copy
-from torch.utils.data import Dataset, DataLoader
-import os
-from tqdm import tqdm
 
 class ContentLoss(nn.Module):
     def __init__(self, target):
@@ -48,11 +45,14 @@ class StyleTransfer:
         
     def _image_loader(self, image_path):
         loader = transforms.Compose([
-            transforms.Resize(512),
+            transforms.Resize((512, 512)),  # Resize to fixed size
             transforms.ToTensor()])
         image = Image.open(image_path)
         image = loader(image).unsqueeze(0)
         return image.to(self.device, torch.float)
+    
+    def _resize_image(self, img):
+        return transforms.Resize(self.content_img.shape[2:])(img)
     
     def tensor_to_pil(self, tensor):
         image = tensor.cpu().clone()
@@ -61,6 +61,7 @@ class StyleTransfer:
         return image
 
     def run_style_transfer(self, num_steps=300, content_weight=1, style_weight=1000000):
+        self.style_img = self._resize_image(self.style_img)  # Resize style image
         input_img = self.content_img.clone()
         optimizer = optim.LBFGS([input_img.requires_grad_()])
         
@@ -149,5 +150,9 @@ class StyleTransfer:
                 style_loss = StyleLoss(target_feature)
                 model.add_module(f"style_loss_{i}", style_loss)
                 style_losses.append(style_loss)
+            
+            # Break the loop if we've added all necessary losses
+            if len(content_losses) == len(self.content_layers) and len(style_losses) == len(self.style_layers):
+                break
                 
         return model, style_losses, content_losses
